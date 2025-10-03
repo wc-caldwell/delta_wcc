@@ -24,7 +24,6 @@ import concurrent.futures
 import copy
 import functools
 from typing import Callable, Iterator, List, Tuple
-
 import numpy as np
 
 from delta.imagery import rectangle, utilities
