@@ -23,11 +23,88 @@ See the `delta.config` documentation for details.
 """
 import math
 
-from packaging import version
 import tensorflow as tf
-import tensorflow_addons as tfa
 
 from delta.config.extensions import register_augmentation
+
+
+def _image_projective_transform(image: tf.Tensor,
+                                transform: tf.Tensor,
+                                *,
+                                fill_mode: str = 'REFLECT',
+                                interpolation: str = 'BILINEAR',
+                                fill_value: float = 0.0) -> tf.Tensor:
+    """Apply a projective transform to a single image tensor."""
+    image = tf.convert_to_tensor(image)
+    original_dtype = image.dtype
+
+    squeeze_channel = False
+    if image.shape.rank == 2:
+        image = image[..., tf.newaxis]
+        squeeze_channel = True
+
+    if image.shape.rank != 3:
+        raise ValueError('Expected image tensor with rank 2 or 3.')
+
+    image = tf.cast(image, tf.float32)
+    batched_image = tf.expand_dims(image, 0)
+    batched_transform = tf.reshape(tf.cast(transform, tf.float32), [1, 8])
+
+    transformed = tf.raw_ops.ImageProjectiveTransformV3(
+        images=batched_image,
+        transforms=batched_transform,
+        output_shape=tf.shape(batched_image)[1:3],
+        interpolation=interpolation.upper(),
+        fill_mode=fill_mode.upper(),
+        fill_value=tf.cast(fill_value, batched_image.dtype))
+
+    result = transformed[0]
+    if squeeze_channel:
+        result = result[..., 0]
+
+    return tf.cast(result, original_dtype)
+
+
+def _rotation_transform(angle: tf.Tensor, height: tf.Tensor, width: tf.Tensor) -> tf.Tensor:
+    """Compute the projective transform for a rotation about the image center."""
+    angle = tf.cast(angle, tf.float32)
+    height = tf.cast(height, tf.float32)
+    width = tf.cast(width, tf.float32)
+
+    cos_theta = tf.math.cos(angle)
+    sin_theta = tf.math.sin(angle)
+
+    height_minus_one = height - 1.0
+    width_minus_one = width - 1.0
+
+    x_offset = ((width_minus_one) - (cos_theta * width_minus_one - sin_theta * height_minus_one)) / 2.0
+    y_offset = ((height_minus_one) - (sin_theta * width_minus_one + cos_theta * height_minus_one)) / 2.0
+
+    return tf.stack([
+        cos_theta,
+        -sin_theta,
+        x_offset,
+        sin_theta,
+        cos_theta,
+        y_offset,
+        tf.zeros([], tf.float32),
+        tf.zeros([], tf.float32)
+    ])
+
+
+def _translation_transform(offsets: tf.Tensor) -> tf.Tensor:
+    """Compute the projective transform for a translation."""
+    offsets = tf.cast(offsets, tf.float32)
+    return tf.stack([
+        1.0,
+        0.0,
+        -offsets[0],
+        0.0,
+        1.0,
+        -offsets[1],
+        0.0,
+        0.0
+    ])
 
 def random_flip_left_right(probability=0.5):
     """
@@ -91,14 +168,15 @@ def random_rotate(probability=0.5, max_angle=5.0):
     def rand_rotation(image, label):
         r = tf.random.uniform(shape=[], dtype=tf.dtypes.float32)
         theta = tf.random.uniform([], -max_angle, max_angle, tf.dtypes.float32)
-        if version.parse(tfa.__version__) < version.parse('0.12'): # fill_mode not supported
-            result = tf.cond(r > probability, lambda: (image, label),
-                             lambda: (tfa.image.rotate(image, theta),
-                                      tfa.image.rotate(label, theta)))
-        else:
-            result = tf.cond(r > probability, lambda: (image, label),
-                             lambda: (tfa.image.rotate(image, theta, fill_mode='reflect'),
-                                      tfa.image.rotate(label, theta, fill_mode='reflect')))
+        def apply_rotation():
+            height = tf.shape(image)[0]
+            width = tf.shape(image)[1]
+            transform = _rotation_transform(theta, height, width)
+            return (
+                _image_projective_transform(image, transform, fill_mode='REFLECT'),
+                _image_projective_transform(label, transform, fill_mode='REFLECT')
+            )
+        result = tf.cond(r > probability, lambda: (image, label), apply_rotation)
         return result
     return rand_rotation
 
@@ -121,14 +199,13 @@ def random_translate(probability=0.5, max_pixels=7):
     def rand_translate(image, label):
         r = tf.random.uniform(shape=[], dtype=tf.dtypes.float32)
         t = tf.random.uniform([2], -max_pixels, max_pixels, tf.dtypes.float32)
-        if version.parse(tfa.__version__) < version.parse('0.12'): # fill_mode not supported
-            result = tf.cond(r > probability, lambda: (image, label),
-                             lambda: (tfa.image.translate(image, t),
-                                      tfa.image.translate(label, t)))
-        else:
-            result = tf.cond(r > probability, lambda: (image, label),
-                             lambda: (tfa.image.translate(image, t, fill_mode='reflect'),
-                                      tfa.image.translate(label, t, fill_mode='reflect')))
+        def apply_translate():
+            transform = _translation_transform(t)
+            return (
+                _image_projective_transform(image, transform, fill_mode='REFLECT'),
+                _image_projective_transform(label, transform, fill_mode='REFLECT')
+            )
+        result = tf.cond(r > probability, lambda: (image, label), apply_translate)
         return result
     return rand_translate
 

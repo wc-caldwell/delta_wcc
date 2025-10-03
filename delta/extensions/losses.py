@@ -25,7 +25,6 @@ import tensorflow as tf
 import tensorflow.keras.losses #pylint: disable=no-name-in-module
 import tensorflow.keras.backend as K #pylint: disable=no-name-in-module
 from tensorflow.python.keras.utils import losses_utils
-import tensorflow_addons as tfa
 from scipy.ndimage import distance_transform_edt as distance
 
 from delta.config import config
@@ -124,6 +123,36 @@ def surface_loss(y_true, y_pred):
     y_true_dist_map.set_shape((y_true.shape[0], y_true.shape[1], y_true.shape[2], y_true.shape[3], 2))
     multipled = y_pred * y_true_dist_map[:, :, :, :, 0] + (1 - y_pred) * y_true_dist_map[:, :, :, :, 1]
     return tf.squeeze(multipled, -1)
+
+class SigmoidFocalCrossEntropy(tf.keras.losses.Loss):
+    """Sigmoid focal cross entropy loss mirroring the TensorFlow Addons API."""
+
+    def __init__(self, alpha=0.25, gamma=2.0, from_logits=True,
+                 reduction=losses_utils.ReductionV2.AUTO, name='sigmoid_focal_crossentropy'):
+        super().__init__(reduction=reduction, name=name)
+        self.alpha = alpha
+        self.gamma = gamma
+        self.from_logits = from_logits
+
+    def call(self, y_true, y_pred):
+        y_true = tf.cast(y_true, y_pred.dtype)
+        if self.from_logits:
+            logits = y_pred
+            probs = tf.nn.sigmoid(logits)
+            cross_entropy = tf.nn.sigmoid_cross_entropy_with_logits(labels=y_true, logits=logits)
+        else:
+            probs = tf.clip_by_value(y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+            cross_entropy = tf.keras.backend.binary_crossentropy(y_true, probs, from_logits=False)
+
+        p_t = y_true * probs + (1.0 - y_true) * (1.0 - probs)
+        modulating_factor = tf.pow(1.0 - p_t, self.gamma)
+        alpha_factor = y_true * self.alpha + (1.0 - y_true) * (1.0 - self.alpha)
+        return alpha_factor * modulating_factor * cross_entropy
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'alpha': self.alpha, 'gamma': self.gamma, 'from_logits': self.from_logits})
+        return config
 
 class MappedLoss(tf.keras.losses.Loss): #pylint: disable=abstract-method
     def __init__(self, mapping, name=None, reduction=losses_utils.ReductionV2.AUTO):
@@ -293,7 +322,7 @@ register_loss('ms_ssim', ms_ssim)
 register_loss('ms_ssim_mse', ms_ssim_mse)
 register_loss('dice', dice_loss)
 register_loss('surface', surface_loss)
-register_loss('focal', tfa.losses.SigmoidFocalCrossEntropy)
+register_loss('focal', SigmoidFocalCrossEntropy)
 register_loss('MappedCategoricalCrossentropy', MappedCategoricalCrossentropy)
 register_loss('MappedBinaryCrossentropy', MappedBinaryCrossentropy)
 register_loss('MappedDice', MappedDiceLoss)
